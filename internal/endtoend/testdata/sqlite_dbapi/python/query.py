@@ -3,7 +3,7 @@
 #   sqlc v1.28.0
 # source: query.sql
 import dataclasses
-from typing import Any, AsyncIterator, Iterator, Optional, Protocol, Sequence
+from typing import Any, AsyncIterator, Iterator, Optional, Protocol, Sequence, cast
 
 from querytest import models
 
@@ -49,6 +49,16 @@ WHERE id = ?
 """
 
 
+GET_RECORD_NAME = """-- name: get_record_name \\:one
+SELECT name FROM records WHERE id = ?
+"""
+
+
+GET_RECORD_NOTE = """-- name: get_record_note \\:one
+SELECT note FROM records WHERE id = ?
+"""
+
+
 INSERT_RECORD = """-- name: insert_record \\:one
 INSERT INTO records (name, note, payload, score, dynamic_value)
 VALUES (?, ?, ?, ?, ?)
@@ -63,6 +73,11 @@ class InsertRecordParams:
     payload: bytes
     score: Optional[float]
     dynamic_value: Optional[Any]
+
+
+LIST_RECORD_NOTES = """-- name: list_record_notes \\:many
+SELECT note FROM records ORDER BY id
+"""
 
 
 LIST_RECORDS = """-- name: list_records \\:many
@@ -105,6 +120,20 @@ class Querier:
             dynamic_value=row[5],
         )
 
+    def get_record_name(self, *, id: int) -> Optional[str]:
+        cursor = self._conn.execute(GET_RECORD_NAME, (id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return cast(str, row[0])
+
+    def get_record_note(self, *, id: int) -> Optional[Optional[str]]:
+        cursor = self._conn.execute(GET_RECORD_NOTE, (id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return cast(Optional[str], row[0])
+
     def insert_record(self, arg: InsertRecordParams) -> Optional[models.Record]:
         cursor = self._conn.execute(INSERT_RECORD, (arg.name, arg.note, arg.payload, arg.score, arg.dynamic_value))
         row = cursor.fetchone()
@@ -118,6 +147,12 @@ class Querier:
             score=row[4],
             dynamic_value=row[5],
         )
+
+    def list_record_notes(self) -> Iterator[Optional[str]]:
+        cursor = self._conn.execute(LIST_RECORD_NOTES, ())
+        result = cursor.fetchall()
+        for row in result:
+            yield cast(Optional[str], row[0])
 
     def list_records(self, *, name: str) -> Iterator[models.Record]:
         cursor = self._conn.execute(LIST_RECORDS, (name, name))
@@ -163,6 +198,20 @@ class AsyncQuerier:
             dynamic_value=row[5],
         )
 
+    async def get_record_name(self, *, id: int) -> Optional[str]:
+        cursor = await self._conn.execute(GET_RECORD_NAME, (id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return cast(str, row[0])
+
+    async def get_record_note(self, *, id: int) -> Optional[Optional[str]]:
+        cursor = await self._conn.execute(GET_RECORD_NOTE, (id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return cast(Optional[str], row[0])
+
     async def insert_record(self, arg: InsertRecordParams) -> Optional[models.Record]:
         cursor = await self._conn.execute(INSERT_RECORD, (arg.name, arg.note, arg.payload, arg.score, arg.dynamic_value))
         row = cursor.fetchone()
@@ -176,6 +225,12 @@ class AsyncQuerier:
             score=row[4],
             dynamic_value=row[5],
         )
+
+    async def list_record_notes(self) -> AsyncIterator[Optional[str]]:
+        cursor = await self._conn.execute(LIST_RECORD_NOTES, ())
+        result = cursor.fetchall()
+        for row in result:
+            yield cast(Optional[str], row[0])
 
     async def list_records(self, *, name: str) -> AsyncIterator[models.Record]:
         cursor = await self._conn.execute(LIST_RECORDS, (name, name))

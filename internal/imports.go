@@ -138,6 +138,7 @@ func (i *importer) queryImportSpecs(fileName string) (map[string]importSpec, map
 		}
 	} else if i.C.EmitSyncQuerier || i.C.EmitAsyncQuerier {
 		std["typing.Any"] = importSpec{Module: "typing", Name: "Any"}
+		std["typing.cast"] = importSpec{Module: "typing", Name: "cast"}
 		std["typing.Optional"] = importSpec{Module: "typing", Name: "Optional"}
 		std["typing.Protocol"] = importSpec{Module: "typing", Name: "Protocol"}
 		std["typing.Sequence"] = importSpec{Module: "typing", Name: "Sequence"}

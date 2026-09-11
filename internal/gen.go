@@ -96,12 +96,22 @@ func (v QueryValue) isEmpty() bool {
 	return v.Typ == (pyType{}) && v.Name == "" && v.Struct == nil
 }
 
-func (v QueryValue) RowNode(rowVar string) *pyast.Node {
+func (v QueryValue) RowNode(rowVar, driver string) *pyast.Node {
 	if !v.IsStruct() {
-		return subscriptNode(
+		value := subscriptNode(
 			rowVar,
 			constantInt(0),
 		)
+		if driver == driverDBAPI {
+			return poet.Node(&pyast.Call{
+				Func: poet.Name("cast"),
+				Args: []*pyast.Node{
+					v.Annotation(),
+					value,
+				},
+			})
+		}
+		return value
 	}
 	call := &pyast.Call{
 		Func: v.Annotation(),
@@ -1173,7 +1183,7 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							},
 						},
 					),
-					poet.Return(q.Ret.RowNode("row")),
+					poet.Return(q.Ret.RowNode("row", driver)),
 				)
 				f.Returns = subscriptNode("Optional", q.Ret.Annotation())
 			case ":many":
@@ -1191,7 +1201,7 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							Body: []*pyast.Node{
 								poet.Expr(
 									poet.Yield(
-										q.Ret.RowNode("row"),
+										q.Ret.RowNode("row", driver),
 									),
 								),
 							},
@@ -1279,7 +1289,7 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							},
 						},
 					),
-					poet.Return(q.Ret.RowNode("row")),
+					poet.Return(q.Ret.RowNode("row", driver)),
 				)
 				f.Returns = subscriptNode("Optional", q.Ret.Annotation())
 			case ":many":
@@ -1293,7 +1303,7 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							Body: []*pyast.Node{
 								poet.Expr(
 									poet.Yield(
-										q.Ret.RowNode("row"),
+										q.Ret.RowNode("row", driver),
 									),
 								),
 							},
@@ -1310,7 +1320,7 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 								Body: []*pyast.Node{
 									poet.Expr(
 										poet.Yield(
-											q.Ret.RowNode("row"),
+											q.Ret.RowNode("row", driver),
 										),
 									),
 								},

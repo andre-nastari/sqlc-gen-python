@@ -1,11 +1,14 @@
 package endtoend
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 )
 
-func TestSQLiteExecRowsReturningConsumesRows(t *testing.T) {
+func python312(t *testing.T) string {
+	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
 		t.Skip("python3 is required for the sqlite3 rowcount regression test")
@@ -13,6 +16,11 @@ func TestSQLiteExecRowsReturningConsumesRows(t *testing.T) {
 	if err := exec.Command(python, "-c", "import sys; assert sys.version_info >= (3, 12)").Run(); err != nil {
 		t.Skip("python3.12 or newer is required for the sqlite3 rowcount regression test")
 	}
+	return python
+}
+
+func TestSQLiteExecRowsReturningConsumesRows(t *testing.T) {
+	python := python312(t)
 
 	script := `
 import importlib.util
@@ -57,5 +65,36 @@ assert affected == 2, affected
 	cmd := exec.Command(python, "-c", script)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("generated SQLite querier failed: %s\n%s", err, output)
+	}
+}
+
+func TestSQLiteGoldenPassesMypyStrict(t *testing.T) {
+	python := python312(t)
+	if err := exec.Command(python, "-c", "import mypy").Run(); err != nil {
+		t.Skip("mypy is required for the generated-code type-check regression test")
+	}
+
+	tempDir := t.TempDir()
+	packageDir := filepath.Join(tempDir, "querytest")
+	if err := os.Mkdir(packageDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"models.py", "query.py"} {
+		source := filepath.Join("testdata", "sqlite_dbapi", "python", name)
+		contents, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(packageDir, name), contents, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(packageDir, "__init__.py"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(python, "-m", "mypy", "--strict", "--cache-dir", filepath.Join(tempDir, "mypy-cache"), packageDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("generated SQLite querier failed strict mypy: %s\n%s", err, output)
 	}
 }
