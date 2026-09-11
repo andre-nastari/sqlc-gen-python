@@ -171,6 +171,12 @@ func (w *writer) printAsyncFor(n *ast.AsyncFor, indent int32) {
 }
 
 func (w *writer) printAsyncFunctionDef(afd *ast.AsyncFunctionDef, indent int32) {
+	for _, node := range afd.DecoratorList {
+		w.print("@")
+		w.printNode(node, indent)
+		w.print("\n")
+		w.printIndent(indent)
+	}
 	w.print("async ")
 	w.printFunctionDef(&ast.FunctionDef{
 		Name:    afd.Name,
@@ -370,10 +376,26 @@ func (w *writer) printIf(i *ast.If, indent int32) {
 }
 
 func (w *writer) printFunctionDef(fd *ast.FunctionDef, indent int32) {
+	for _, node := range fd.DecoratorList {
+		w.print("@")
+		w.printNode(node, indent)
+		w.print("\n")
+		w.printIndent(indent)
+	}
 	w.print("def ")
 	w.print(fd.Name)
 	w.print("(")
 	if fd.Args != nil {
+		for _, arg := range fd.Args.PosOnlyArgs {
+			w.printArg(arg, indent)
+			w.print(", ")
+		}
+		if len(fd.Args.PosOnlyArgs) > 0 {
+			w.print("/")
+			if len(fd.Args.Args) > 0 || len(fd.Args.KwOnlyArgs) > 0 {
+				w.print(", ")
+			}
+		}
 		for i, arg := range fd.Args.Args {
 			w.printArg(arg, indent)
 			if i != len(fd.Args.Args)-1 {

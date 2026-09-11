@@ -7,13 +7,12 @@ plugins:
 sql:
   - schema: schema.sql
     queries: query.sql
-    engine: postgresql
+    engine: sqlite
     codegen:
       - plugin: py
-        out: db
+        out: python
         options:
-          package: db
+          package: querytest
+          driver: dbapi
           emit_sync_querier: true
           emit_async_querier: true
-          emit_str_enum: true
-
