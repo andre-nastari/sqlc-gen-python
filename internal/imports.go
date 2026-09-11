@@ -131,9 +131,17 @@ func (i *importer) queryImportSpecs(fileName string) (map[string]importSpec, map
 	std := stdImports(queryUses)
 
 	pkg := make(map[string]importSpec)
-	pkg["sqlalchemy"] = importSpec{Module: "sqlalchemy"}
-	if i.C.EmitAsyncQuerier {
-		pkg["sqlalchemy.ext.asyncio"] = importSpec{Module: "sqlalchemy.ext.asyncio"}
+	if i.C.driver() == driverSQLAlchemy {
+		pkg["sqlalchemy"] = importSpec{Module: "sqlalchemy"}
+		if i.C.EmitAsyncQuerier {
+			pkg["sqlalchemy.ext.asyncio"] = importSpec{Module: "sqlalchemy.ext.asyncio"}
+		}
+	} else if i.C.EmitSyncQuerier || i.C.EmitAsyncQuerier {
+		std["typing.Any"] = importSpec{Module: "typing", Name: "Any"}
+		std["typing.cast"] = importSpec{Module: "typing", Name: "cast"}
+		std["typing.Optional"] = importSpec{Module: "typing", Name: "Optional"}
+		std["typing.Protocol"] = importSpec{Module: "typing", Name: "Protocol"}
+		std["typing.Sequence"] = importSpec{Module: "typing", Name: "Sequence"}
 	}
 
 	queryValueModelImports := func(qv QueryValue) {

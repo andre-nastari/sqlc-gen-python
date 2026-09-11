@@ -8,6 +8,7 @@ import (
 	"log"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/sqlc-dev/plugin-sdk-go/metadata"
@@ -95,12 +96,22 @@ func (v QueryValue) isEmpty() bool {
 	return v.Typ == (pyType{}) && v.Name == "" && v.Struct == nil
 }
 
-func (v QueryValue) RowNode(rowVar string) *pyast.Node {
+func (v QueryValue) RowNode(rowVar, driver string) *pyast.Node {
 	if !v.IsStruct() {
-		return subscriptNode(
+		value := subscriptNode(
 			rowVar,
 			constantInt(0),
 		)
+		if driver == driverDBAPI {
+			return poet.Node(&pyast.Call{
+				Func: poet.Name("cast"),
+				Args: []*pyast.Node{
+					v.Annotation(),
+					value,
+				},
+			})
+		}
+		return value
 	}
 	call := &pyast.Call{
 		Func: v.Annotation(),
@@ -123,15 +134,16 @@ func (v QueryValue) RowNode(rowVar string) *pyast.Node {
 
 // A struct used to generate methods and fields on the Queries struct
 type Query struct {
-	Cmd          string
-	Comments     []string
-	MethodName   string
-	FieldName    string
-	ConstantName string
-	SQL          string
-	SourceName   string
-	Ret          QueryValue
-	Args         []QueryValue
+	Cmd            string
+	Comments       []string
+	MethodName     string
+	FieldName      string
+	ConstantName   string
+	SQL            string
+	SourceName     string
+	Ret            QueryValue
+	Args           []QueryValue
+	PositionalArgs []string
 }
 
 func (q Query) AddArgs(args *pyast.Arguments) {
@@ -180,6 +192,17 @@ func (q Query) ArgDictNode() *pyast.Node {
 	}
 }
 
+func (q Query) PositionalTupleNode() *pyast.Node {
+	switch len(q.PositionalArgs) {
+	case 0:
+		return poet.Name("()")
+	case 1:
+		return poet.Name("(" + q.PositionalArgs[0] + ",)")
+	default:
+		return poet.Name("(" + strings.Join(q.PositionalArgs, ", ") + ")")
+	}
+}
+
 func makePyType(req *plugin.GenerateRequest, col *plugin.Column) pyType {
 	typ := pyInnerType(req, col)
 	return pyType{
@@ -193,6 +216,8 @@ func pyInnerType(req *plugin.GenerateRequest, col *plugin.Column) string {
 	switch req.Settings.Engine {
 	case "postgresql":
 		return postgresType(req, col)
+	case "sqlite":
+		return sqliteType(col)
 	default:
 		log.Println("unsupported engine type")
 		return "Any"
@@ -363,6 +388,112 @@ func sqlalchemySQL(s, engine string) string {
 	return s
 }
 
+// dbapiSQL converts SQLite's numbered placeholders to the qmark paramstyle and
+// returns their logical parameter numbers in occurrence order. Keeping this
+// order separate from query.Params is important when the same logical
+// parameter occurs more than once in a statement.
+func dbapiSQL(s, engine string) (string, []int32, error) {
+	if engine != "sqlite" {
+		return "", nil, fmt.Errorf("driver %q only supports the sqlite engine", driverDBAPI)
+	}
+
+	next := int32(1)
+	var order []int32
+	var sql strings.Builder
+	sql.Grow(len(s))
+	for index := 0; index < len(s); {
+		switch {
+		case s[index] == '\'' || s[index] == '"' || s[index] == '`':
+			quote := s[index]
+			sql.WriteByte(quote)
+			index++
+			for index < len(s) {
+				sql.WriteByte(s[index])
+				if s[index] != quote {
+					index++
+					continue
+				}
+				index++
+				if index < len(s) && s[index] == quote {
+					sql.WriteByte(s[index])
+					index++
+					continue
+				}
+				break
+			}
+		case s[index] == '[':
+			end := strings.IndexByte(s[index+1:], ']')
+			if end < 0 {
+				sql.WriteString(s[index:])
+				index = len(s)
+			} else {
+				end += index + 2
+				sql.WriteString(s[index:end])
+				index = end
+			}
+		case strings.HasPrefix(s[index:], "--"):
+			end := strings.IndexByte(s[index:], '\n')
+			if end < 0 {
+				sql.WriteString(s[index:])
+				index = len(s)
+			} else {
+				end += index + 1
+				sql.WriteString(s[index:end])
+				index = end
+			}
+		case strings.HasPrefix(s[index:], "/*"):
+			end := strings.Index(s[index+2:], "*/")
+			if end < 0 {
+				sql.WriteString(s[index:])
+				index = len(s)
+			} else {
+				end += index + 4
+				sql.WriteString(s[index:end])
+				index = end
+			}
+		case s[index] == '?':
+			end := index + 1
+			for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+				end++
+			}
+			placeholder := s[index:end]
+			number := next
+			if len(placeholder) > 1 {
+				parsed, err := strconv.ParseInt(placeholder[1:], 10, 32)
+				if err != nil || parsed < 1 {
+					return "", nil, fmt.Errorf("invalid SQLite placeholder %q", placeholder)
+				}
+				number = int32(parsed)
+				if number >= next {
+					next = number + 1
+				}
+			} else {
+				next++
+			}
+			order = append(order, number)
+			sql.WriteByte('?')
+			index = end
+		default:
+			sql.WriteByte(s[index])
+			index++
+		}
+	}
+	return sql.String(), order, nil
+}
+
+func uniqueQueryParams(params []*plugin.Parameter) []*plugin.Parameter {
+	seen := make(map[int32]struct{}, len(params))
+	unique := make([]*plugin.Parameter, 0, len(params))
+	for _, param := range params {
+		if _, ok := seen[param.Number]; ok {
+			continue
+		}
+		seen[param.Number] = struct{}{}
+		unique = append(unique, param)
+	}
+	return unique
+}
+
 func buildQueries(conf Config, req *plugin.GenerateRequest, structs []Struct) ([]Query, error) {
 	qs := make([]Query, 0, len(req.Queries))
 	for _, query := range req.Queries {
@@ -378,13 +509,23 @@ func buildQueries(conf Config, req *plugin.GenerateRequest, structs []Struct) ([
 
 		methodName := methodName(query.Name)
 
+		querySQL := sqlalchemySQL(query.Text, req.Settings.Engine)
+		var positionalOrder []int32
+		if conf.driver() == driverDBAPI {
+			var err error
+			querySQL, positionalOrder, err = dbapiSQL(query.Text, req.Settings.Engine)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		gq := Query{
 			Cmd:          query.Cmd,
 			Comments:     query.Comments,
 			MethodName:   methodName,
 			FieldName:    sdk.LowerTitle(query.Name) + "Stmt",
 			ConstantName: strings.ToUpper(methodName),
-			SQL:          sqlalchemySQL(query.Text, req.Settings.Engine),
+			SQL:          querySQL,
 			SourceName:   query.Filename,
 		}
 
@@ -395,9 +536,14 @@ func buildQueries(conf Config, req *plugin.GenerateRequest, structs []Struct) ([
 		if qpl < 0 {
 			return nil, errors.New("invalid query parameter limit")
 		}
-		if len(query.Params) > qpl || qpl == 0 {
+		params := query.Params
+		if conf.driver() == driverDBAPI {
+			params = uniqueQueryParams(params)
+		}
+		paramExpressions := make(map[int32]string, len(params))
+		if len(params) > qpl || qpl == 0 {
 			var cols []pyColumn
-			for _, p := range query.Params {
+			for _, p := range params {
 				cols = append(cols, pyColumn{
 					id:     p.Number,
 					Column: p.Column,
@@ -408,15 +554,26 @@ func buildQueries(conf Config, req *plugin.GenerateRequest, structs []Struct) ([
 				Name:   "arg",
 				Struct: columnsToStruct(req, query.Name+"Params", cols),
 			}}
+			for index, p := range params {
+				paramExpressions[p.Number] = "arg." + gq.Args[0].Struct.Fields[index].Name
+			}
 		} else {
-			args := make([]QueryValue, 0, len(query.Params))
-			for _, p := range query.Params {
+			args := make([]QueryValue, 0, len(params))
+			for _, p := range params {
 				args = append(args, QueryValue{
 					Name: paramName(p),
 					Typ:  makePyType(req, p.Column),
 				})
+				paramExpressions[p.Number] = paramName(p)
 			}
 			gq.Args = args
+		}
+		for _, number := range positionalOrder {
+			expression, ok := paramExpressions[number]
+			if !ok {
+				return nil, fmt.Errorf("SQLite placeholder ?%d has no matching query parameter in %s", number, query.Name)
+			}
+			gq.PositionalArgs = append(gq.PositionalArgs, expression)
 		}
 
 		if len(query.Columns) == 1 {
@@ -621,9 +778,12 @@ func typeRefNode(base string, parts ...string) *pyast.Node {
 	return n
 }
 
-func connMethodNode(method, name string, arg *pyast.Node) *pyast.Node {
-	args := []*pyast.Node{
-		{
+func connMethodNode(driver, method, name string, arg *pyast.Node) *pyast.Node {
+	var statement *pyast.Node
+	if driver == driverDBAPI {
+		statement = poet.Name(name)
+	} else {
+		statement = &pyast.Node{
 			Node: &pyast.Node_Call{
 				Call: &pyast.Call{
 					Func: typeRefNode("sqlalchemy", "text"),
@@ -632,8 +792,9 @@ func connMethodNode(method, name string, arg *pyast.Node) *pyast.Node {
 					},
 				},
 			},
-		},
+		}
 	}
+	args := []*pyast.Node{statement}
 	if arg != nil {
 		args = append(args, arg)
 	}
@@ -645,6 +806,23 @@ func connMethodNode(method, name string, arg *pyast.Node) *pyast.Node {
 			},
 		},
 	}
+}
+
+func execRowsBody(driver string, q Query, exec *pyast.Node, async bool) []*pyast.Node {
+	result := exec
+	if async {
+		result = poet.Await(exec)
+	}
+	body := []*pyast.Node{assignNode("result", result)}
+	if driver == driverDBAPI && !q.Ret.isEmpty() {
+		// SQLite does not finalize a DML statement with RETURNING until all
+		// returned rows are consumed. Some DB-API implementations only update
+		// rowcount at that point.
+		body = append(body, poet.Expr(poet.Node(&pyast.Call{
+			Func: typeRefNode("result", "fetchall"),
+		})))
+	}
+	return append(body, poet.Return(poet.Attribute(poet.Name("result"), "rowcount")))
 }
 
 func buildImportGroup(specs map[string]importSpec) *pyast.Node {
@@ -743,7 +921,11 @@ func buildModelsTree(ctx *pyTmplCtx, i *importer) *pyast.Node {
 	return &pyast.Node{Node: &pyast.Node_Module{Module: mod}}
 }
 
-func querierClassDef() *pyast.ClassDef {
+func querierClassDef(driver string) *pyast.ClassDef {
+	connectionType := typeRefNode("sqlalchemy", "engine", "Connection")
+	if driver == driverDBAPI {
+		connectionType = poet.Name("_DBAPIConnection")
+	}
 	return &pyast.ClassDef{
 		Name: "Querier",
 		Body: []*pyast.Node{
@@ -758,7 +940,7 @@ func querierClassDef() *pyast.ClassDef {
 								},
 								{
 									Arg:        "conn",
-									Annotation: typeRefNode("sqlalchemy", "engine", "Connection"),
+									Annotation: connectionType,
 								},
 							},
 						},
@@ -781,7 +963,11 @@ func querierClassDef() *pyast.ClassDef {
 	}
 }
 
-func asyncQuerierClassDef() *pyast.ClassDef {
+func asyncQuerierClassDef(driver string) *pyast.ClassDef {
+	connectionType := typeRefNode("sqlalchemy", "ext", "asyncio", "AsyncConnection")
+	if driver == driverDBAPI {
+		connectionType = poet.Name("_AsyncDBAPIConnection")
+	}
 	return &pyast.ClassDef{
 		Name: "AsyncQuerier",
 		Body: []*pyast.Node{
@@ -796,7 +982,7 @@ func asyncQuerierClassDef() *pyast.ClassDef {
 								},
 								{
 									Arg:        "conn",
-									Annotation: typeRefNode("sqlalchemy", "ext", "asyncio", "AsyncConnection"),
+									Annotation: connectionType,
 								},
 							},
 						},
@@ -817,6 +1003,70 @@ func asyncQuerierClassDef() *pyast.ClassDef {
 			},
 		},
 	}
+}
+
+func dbapiProtocolNodes(conf Config) []*pyast.Node {
+	pass := func() *pyast.Node {
+		return &pyast.Node{Node: &pyast.Node_Pass{Pass: &pyast.Pass{}}}
+	}
+	cursor := &pyast.ClassDef{
+		Name:  "_DBAPICursor",
+		Bases: []*pyast.Node{poet.Name("Protocol")},
+		Body: []*pyast.Node{
+			poet.Node(&pyast.FunctionDef{
+				Name:          "rowcount",
+				Args:          &pyast.Arguments{Args: []*pyast.Arg{{Arg: "self"}}},
+				Body:          []*pyast.Node{pass()},
+				Returns:       poet.Name("int"),
+				DecoratorList: []*pyast.Node{poet.Name("property")},
+			}),
+			poet.Node(&pyast.FunctionDef{
+				Name:    "fetchone",
+				Args:    &pyast.Arguments{Args: []*pyast.Arg{{Arg: "self"}}},
+				Body:    []*pyast.Node{pass()},
+				Returns: poet.Name("Optional[Sequence[Any]]"),
+			}),
+			poet.Node(&pyast.FunctionDef{
+				Name:    "fetchall",
+				Args:    &pyast.Arguments{Args: []*pyast.Arg{{Arg: "self"}}},
+				Body:    []*pyast.Node{pass()},
+				Returns: poet.Name("Sequence[Sequence[Any]]"),
+			}),
+		},
+	}
+	nodes := []*pyast.Node{poet.Node(cursor)}
+	executeArgs := func() *pyast.Arguments {
+		return &pyast.Arguments{PosOnlyArgs: []*pyast.Arg{
+			{Arg: "self"},
+			{Arg: "sql", Annotation: poet.Name("str")},
+			{Arg: "parameters", Annotation: poet.Name("tuple[Any, ...]")},
+		}}
+	}
+	if conf.EmitSyncQuerier {
+		nodes = append(nodes, poet.Node(&pyast.ClassDef{
+			Name:  "_DBAPIConnection",
+			Bases: []*pyast.Node{poet.Name("Protocol")},
+			Body: []*pyast.Node{poet.Node(&pyast.FunctionDef{
+				Name:    "execute",
+				Args:    executeArgs(),
+				Body:    []*pyast.Node{pass()},
+				Returns: poet.Name("_DBAPICursor"),
+			})},
+		}))
+	}
+	if conf.EmitAsyncQuerier {
+		nodes = append(nodes, poet.Node(&pyast.ClassDef{
+			Name:  "_AsyncDBAPIConnection",
+			Bases: []*pyast.Node{poet.Name("Protocol")},
+			Body: []*pyast.Node{poet.Node(&pyast.AsyncFunctionDef{
+				Name:    "execute",
+				Args:    executeArgs(),
+				Body:    []*pyast.Node{pass()},
+				Returns: poet.Name("_DBAPICursor"),
+			})},
+		}))
+	}
+	return nodes
 }
 
 func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
@@ -841,6 +1091,9 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 			},
 		},
 	})
+	if ctx.C.driver() == driverDBAPI && (ctx.C.EmitSyncQuerier || ctx.C.EmitAsyncQuerier) {
+		mod.Body = append(mod.Body, dbapiProtocolNodes(ctx.C)...)
+	}
 
 	for _, q := range ctx.Queries {
 		if !ctx.OutputQuery(q.SourceName) {
@@ -877,7 +1130,8 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 	}
 
 	if ctx.C.EmitSyncQuerier {
-		cls := querierClassDef()
+		driver := ctx.C.driver()
+		cls := querierClassDef(driver)
 		for _, q := range ctx.Queries {
 			if !ctx.OutputQuery(q.SourceName) {
 				continue
@@ -894,16 +1148,21 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 			}
 
 			q.AddArgs(f.Args)
-			exec := connMethodNode("execute", q.ConstantName, q.ArgDictNode())
+			execArg := q.ArgDictNode()
+			if driver == driverDBAPI {
+				execArg = q.PositionalTupleNode()
+			}
+			exec := connMethodNode(driver, "execute", q.ConstantName, execArg)
 
 			switch q.Cmd {
 			case ":one":
+				fetchOne := poet.Node(&pyast.Call{Func: poet.Attribute(exec, "first")})
+				if driver == driverDBAPI {
+					f.Body = append(f.Body, assignNode("cursor", exec))
+					fetchOne = poet.Node(&pyast.Call{Func: typeRefNode("cursor", "fetchone")})
+				}
 				f.Body = append(f.Body,
-					assignNode("row", poet.Node(
-						&pyast.Call{
-							Func: poet.Attribute(exec, "first"),
-						},
-					)),
+					assignNode("row", fetchOne),
 					poet.Node(
 						&pyast.If{
 							Test: poet.Node(
@@ -924,12 +1183,17 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							},
 						},
 					),
-					poet.Return(q.Ret.RowNode("row")),
+					poet.Return(q.Ret.RowNode("row", driver)),
 				)
 				f.Returns = subscriptNode("Optional", q.Ret.Annotation())
 			case ":many":
+				result := exec
+				if driver == driverDBAPI {
+					f.Body = append(f.Body, assignNode("cursor", exec))
+					result = poet.Node(&pyast.Call{Func: typeRefNode("cursor", "fetchall")})
+				}
 				f.Body = append(f.Body,
-					assignNode("result", exec),
+					assignNode("result", result),
 					poet.Node(
 						&pyast.For{
 							Target: poet.Name("row"),
@@ -937,7 +1201,7 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							Body: []*pyast.Node{
 								poet.Expr(
 									poet.Yield(
-										q.Ret.RowNode("row"),
+										q.Ret.RowNode("row", driver),
 									),
 								),
 							},
@@ -949,16 +1213,17 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 				f.Body = append(f.Body, exec)
 				f.Returns = poet.Constant(nil)
 			case ":execrows":
-				f.Body = append(f.Body,
-					assignNode("result", exec),
-					poet.Return(poet.Attribute(poet.Name("result"), "rowcount")),
-				)
+				f.Body = append(f.Body, execRowsBody(driver, q, exec, false)...)
 				f.Returns = poet.Name("int")
 			case ":execresult":
 				f.Body = append(f.Body,
 					poet.Return(exec),
 				)
-				f.Returns = typeRefNode("sqlalchemy", "engine", "Result")
+				if driver == driverDBAPI {
+					f.Returns = poet.Name("_DBAPICursor")
+				} else {
+					f.Returns = typeRefNode("sqlalchemy", "engine", "Result")
+				}
 			default:
 				panic("unknown cmd " + q.Cmd)
 			}
@@ -969,7 +1234,8 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 	}
 
 	if ctx.C.EmitAsyncQuerier {
-		cls := asyncQuerierClassDef()
+		driver := ctx.C.driver()
+		cls := asyncQuerierClassDef(driver)
 		for _, q := range ctx.Queries {
 			if !ctx.OutputQuery(q.SourceName) {
 				continue
@@ -986,16 +1252,23 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 			}
 
 			q.AddArgs(f.Args)
-			exec := connMethodNode("execute", q.ConstantName, q.ArgDictNode())
+			execArg := q.ArgDictNode()
+			if driver == driverDBAPI {
+				execArg = q.PositionalTupleNode()
+			}
+			exec := connMethodNode(driver, "execute", q.ConstantName, execArg)
 
 			switch q.Cmd {
 			case ":one":
+				fetchOne := poet.Node(&pyast.Call{
+					Func: poet.Attribute(poet.Await(exec), "first"),
+				})
+				if driver == driverDBAPI {
+					f.Body = append(f.Body, assignNode("cursor", poet.Await(exec)))
+					fetchOne = poet.Node(&pyast.Call{Func: typeRefNode("cursor", "fetchone")})
+				}
 				f.Body = append(f.Body,
-					assignNode("row", poet.Node(
-						&pyast.Call{
-							Func: poet.Attribute(poet.Await(exec), "first"),
-						},
-					)),
+					assignNode("row", fetchOne),
 					poet.Node(
 						&pyast.If{
 							Test: poet.Node(
@@ -1016,42 +1289,61 @@ func buildQueryTree(ctx *pyTmplCtx, i *importer, source string) *pyast.Node {
 							},
 						},
 					),
-					poet.Return(q.Ret.RowNode("row")),
+					poet.Return(q.Ret.RowNode("row", driver)),
 				)
 				f.Returns = subscriptNode("Optional", q.Ret.Annotation())
 			case ":many":
-				stream := connMethodNode("stream", q.ConstantName, q.ArgDictNode())
-				f.Body = append(f.Body,
-					assignNode("result", poet.Await(stream)),
-					poet.Node(
-						&pyast.AsyncFor{
+				if driver == driverDBAPI {
+					f.Body = append(f.Body,
+						assignNode("cursor", poet.Await(exec)),
+						assignNode("result", poet.Node(&pyast.Call{Func: typeRefNode("cursor", "fetchall")})),
+						poet.Node(&pyast.For{
 							Target: poet.Name("row"),
 							Iter:   poet.Name("result"),
 							Body: []*pyast.Node{
 								poet.Expr(
 									poet.Yield(
-										q.Ret.RowNode("row"),
+										q.Ret.RowNode("row", driver),
 									),
 								),
 							},
-						},
-					),
-				)
+						}),
+					)
+				} else {
+					stream := connMethodNode(driver, "stream", q.ConstantName, q.ArgDictNode())
+					f.Body = append(f.Body,
+						assignNode("result", poet.Await(stream)),
+						poet.Node(
+							&pyast.AsyncFor{
+								Target: poet.Name("row"),
+								Iter:   poet.Name("result"),
+								Body: []*pyast.Node{
+									poet.Expr(
+										poet.Yield(
+											q.Ret.RowNode("row", driver),
+										),
+									),
+								},
+							},
+						),
+					)
+				}
 				f.Returns = subscriptNode("AsyncIterator", q.Ret.Annotation())
 			case ":exec":
 				f.Body = append(f.Body, poet.Await(exec))
 				f.Returns = poet.Constant(nil)
 			case ":execrows":
-				f.Body = append(f.Body,
-					assignNode("result", poet.Await(exec)),
-					poet.Return(poet.Attribute(poet.Name("result"), "rowcount")),
-				)
+				f.Body = append(f.Body, execRowsBody(driver, q, exec, true)...)
 				f.Returns = poet.Name("int")
 			case ":execresult":
 				f.Body = append(f.Body,
 					poet.Return(poet.Await(exec)),
 				)
-				f.Returns = typeRefNode("sqlalchemy", "engine", "Result")
+				if driver == driverDBAPI {
+					f.Returns = poet.Name("_DBAPICursor")
+				} else {
+					f.Returns = typeRefNode("sqlalchemy", "engine", "Result")
+				}
 			default:
 				panic("unknown cmd " + q.Cmd)
 			}
@@ -1087,6 +1379,18 @@ func Generate(_ context.Context, req *plugin.GenerateRequest) (*plugin.GenerateR
 		if err := json.Unmarshal(req.PluginOptions, &conf); err != nil {
 			return nil, err
 		}
+	}
+	switch conf.driver() {
+	case driverSQLAlchemy:
+		if req.Settings.Engine == "sqlite" {
+			return nil, fmt.Errorf("the sqlite engine requires driver %q", driverDBAPI)
+		}
+	case driverDBAPI:
+		if req.Settings.Engine != "sqlite" {
+			return nil, fmt.Errorf("driver %q only supports the sqlite engine", driverDBAPI)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported Python driver %q (expected %q or %q)", conf.Driver, driverSQLAlchemy, driverDBAPI)
 	}
 
 	enums := buildEnums(req)

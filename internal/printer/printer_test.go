@@ -70,6 +70,30 @@ func TestPrinter(t *testing.T) {
 			},
 			Expected: `class Foo(str, enum.Enum):`,
 		},
+		"decorated-positional-only-function": {
+			Node: &ast.Node{
+				Node: &ast.Node_FunctionDef{
+					FunctionDef: &ast.FunctionDef{
+						Name: "rowcount",
+						Args: &ast.Arguments{
+							PosOnlyArgs: []*ast.Arg{{Arg: "self"}},
+						},
+						Body: []*ast.Node{{
+							Node: &ast.Node_Pass{Pass: &ast.Pass{}},
+						}},
+						Returns: &ast.Node{
+							Node: &ast.Node_Name{Name: &ast.Name{Id: "int"}},
+						},
+						DecoratorList: []*ast.Node{{
+							Node: &ast.Node_Name{Name: &ast.Name{Id: "property"}},
+						}},
+					},
+				},
+			},
+			Expected: `@property
+def rowcount(self, /) -> int:
+    pass`,
+		},
 		"dataclass": {
 			Node: &ast.Node{
 				Node: &ast.Node_ClassDef{

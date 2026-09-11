@@ -73,6 +73,7 @@ message Arguments
 {
   repeated Arg args = 1 [json_name="args"];
   repeated Arg kw_only_args = 2 [json_name="kwonlyargs"];
+  repeated Arg pos_only_args = 3 [json_name="posonlyargs"];
 }
 
 message AsyncFor
@@ -88,6 +89,7 @@ message AsyncFunctionDef
   Arguments Args = 2 [json_name="args"];
   repeated Node body = 3 [json_name="body"];
   Node returns = 4 [json_name="returns"];
+  repeated Node decorator_list = 5 [json_name="decorator_list"];
 }
 
 message Assign
@@ -160,6 +162,7 @@ message FunctionDef
   Arguments Args = 2 [json_name="args"];
   repeated Node body = 3 [json_name="body"];
   Node returns = 4 [json_name="returns"];
+  repeated Node decorator_list = 5 [json_name="decorator_list"];
 }
 
 message If
